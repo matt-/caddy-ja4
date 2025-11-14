@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -109,12 +110,16 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // WrapListener wraps the provided listener with the JA4 capturing logic.
 func (lw *ListenerWrapper) WrapListener(ln net.Listener) net.Listener {
+	cache := newFingerprintCache()
+	// Set global cache so handler can access it
+	globalCache = cache
 	return &trackingListener{
 		Listener: ln,
 		cfg: trackerConfig{
 			maxBytes: lw.MaxCaptureBytes,
 			proto:    lw.protocolByte,
 			logger:   lw.logger,
+			cache:    cache,
 		},
 	}
 }
@@ -129,11 +134,46 @@ func (tl *trackingListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	tracked := newTrackedConn(conn, tl.cfg)
-	tl.cfg.logger.Info("wrapped connection with JA4 tracker",
+
+	// Read ClientHello upfront before TLS wraps the connection
+	clientHello, err := readClientHello(conn, tl.cfg.maxBytes)
+	if err != nil {
+		tl.cfg.logger.Debug("failed to read ClientHello from connection",
+			zap.String("remote_addr", conn.RemoteAddr().String()),
+			zap.Error(err),
+		)
+		// Continue anyway - return connection without JA4 capability
+		return conn, nil
+	}
+
+	// Compute JA4 fingerprint immediately
+	fingerprint, err := ja4.ParseClientHelloForJA4(clientHello, tl.cfg.proto)
+	if err != nil {
+		tl.cfg.logger.Debug("failed to parse ClientHello for JA4",
+			zap.String("remote_addr", conn.RemoteAddr().String()),
+			zap.Error(err),
+		)
+		// Return connection with rewind capability so TLS can still read the ClientHello
+		return newRewindConn(conn, clientHello), nil
+	}
+
+	tl.cfg.logger.Debug("computed JA4 fingerprint from ClientHello",
 		zap.String("remote_addr", conn.RemoteAddr().String()),
-		zap.String("conn_type", fmt.Sprintf("%T", conn)),
+		zap.String("fingerprint", fingerprint),
 	)
+
+	// Store fingerprint in cache keyed by connection address
+	addr := conn.RemoteAddr().String()
+	tl.cfg.cache.Set(addr, fingerprint)
+
+	// Create a tracked connection that will clean up the cache on close
+	tracked := &trackedConn{
+		Conn:        newRewindConn(conn, clientHello),
+		addr:        addr,
+		cache:       tl.cfg.cache,
+		fingerprint: fingerprint,
+	}
+
 	return tracked, nil
 }
 
@@ -141,6 +181,39 @@ type trackerConfig struct {
 	maxBytes int
 	proto    byte
 	logger   *zap.Logger
+	cache    *fingerprintCache
+}
+
+// fingerprintCache stores JA4 fingerprints keyed by connection remote address.
+// This allows us to look up fingerprints without needing to unwrap TLS connections.
+type fingerprintCache struct {
+	mu    sync.RWMutex
+	cache map[string]string
+}
+
+func newFingerprintCache() *fingerprintCache {
+	return &fingerprintCache{
+		cache: make(map[string]string),
+	}
+}
+
+func (fc *fingerprintCache) Set(addr string, fingerprint string) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.cache[addr] = fingerprint
+}
+
+func (fc *fingerprintCache) Get(addr string) (string, bool) {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	fp, ok := fc.cache[addr]
+	return fp, ok
+}
+
+func (fc *fingerprintCache) Clear(addr string) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	delete(fc.cache, addr)
 }
 
 // JA4Provider exposes the computed JA4 (client) fingerprint for a connection.
@@ -151,153 +224,119 @@ type JA4Provider interface {
 
 type trackedConn struct {
 	net.Conn
-	clientTracker *clientHelloTracker
+	addr        string
+	cache       *fingerprintCache
+	fingerprint string
+	mu          sync.RWMutex
 }
 
-func newTrackedConn(conn net.Conn, cfg trackerConfig) net.Conn {
-	return &trackedConn{
-		Conn:          conn,
-		clientTracker: newClientHelloTracker(cfg),
+func (tc *trackedConn) Close() error {
+	// Clean up cache entry when connection closes
+	if tc.cache != nil && tc.addr != "" {
+		tc.cache.Clear(tc.addr)
 	}
-}
-
-func (tc *trackedConn) Read(p []byte) (int, error) {
-	n, err := tc.Conn.Read(p)
-	if n > 0 && tc.clientTracker != nil {
-		// Capture ClientHello from incoming data
-		tc.clientTracker.Observe(p[:n])
-	}
-	return n, err
+	return tc.Conn.Close()
 }
 
 func (tc *trackedConn) JA4() (string, error) {
-	if tc.clientTracker == nil {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	if tc.fingerprint == "" {
 		return "", ErrUnavailable
 	}
-	return tc.clientTracker.Result()
+	return tc.fingerprint, nil
 }
+
+// GetFingerprintFromCache retrieves a JA4 fingerprint from the cache by connection address.
+// This is used by the handler to look up fingerprints without needing to unwrap TLS connections.
+func GetFingerprintFromCache(addr string) (string, error) {
+	// This will be set by the listener wrapper's cache
+	// For now, we'll need to pass the cache through the context or make it global
+	// Actually, let's make it a package-level variable that gets set
+	if globalCache == nil {
+		return "", ErrUnavailable
+	}
+	fp, ok := globalCache.Get(addr)
+	if !ok {
+		return "", ErrUnavailable
+	}
+	return fp, nil
+}
+
+// globalCache is set by the listener wrapper and used by the handler
+var globalCache *fingerprintCache
 
 const (
 	minRecordSize = 5
+	// TLS record type constants
+	tlsRecordTypeHandshake = 0x16
+	// TLS handshake type constants
+	tlsHandshakeTypeClientHello = 0x01
 )
 
 // ErrUnavailable signals that the JA4 fingerprint could not be computed.
 var ErrUnavailable = errors.New("ja4 fingerprint unavailable")
 
-// clientHelloTracker keeps the first TLS record that contains the client hello
-// message and runs it through the go-ja4 parser.
-type clientHelloTracker struct {
-	config trackerConfig
+// readClientHello reads the ClientHello TLS record from the connection.
+// This is based on the approach used in caddy-ja3:
+// https://github.com/rushiiMachine/caddy-ja3
+func readClientHello(r io.Reader, maxBytes int) ([]byte, error) {
+	// Read the TLS record header (5 bytes)
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, fmt.Errorf("failed to read TLS record header: %w", err)
+	}
 
-	mu          sync.Mutex
-	buffer      []byte
-	completed   bool
-	fingerprint string
-	err         error
+	// Check if it's a TLS handshake record
+	if header[0] != tlsRecordTypeHandshake {
+		return nil, fmt.Errorf("not a TLS handshake record (got 0x%02x)", header[0])
+	}
+
+	// Get the record length
+	recordLength := int(binary.BigEndian.Uint16(header[3:5]))
+	if recordLength > maxBytes {
+		return nil, fmt.Errorf("record length %d exceeds max bytes %d", recordLength, maxBytes)
+	}
+
+	// Read the rest of the record
+	record := make([]byte, 5+recordLength)
+	copy(record, header)
+	if _, err := io.ReadFull(r, record[5:]); err != nil {
+		return nil, fmt.Errorf("failed to read TLS record body: %w", err)
+	}
+
+	return record, nil
 }
 
-func newClientHelloTracker(cfg trackerConfig) *clientHelloTracker {
-	return &clientHelloTracker{
-		config: cfg,
-		buffer: make([]byte, 0, cfg.maxBytes),
-	}
+// rewindConn creates a connection that allows the ClientHello data to be read again.
+// This is necessary because we read the ClientHello upfront, but TLS needs to read it too.
+type rewindConn struct {
+	net.Conn
+	buf    []byte
+	offset int
+	mu     sync.Mutex
 }
 
-// Observe records inbound TLS data while waiting for the first ClientHello
-// record to show up.
-func (cht *clientHelloTracker) Observe(p []byte) {
-	cht.mu.Lock()
-	defer cht.mu.Unlock()
-
-	if cht.completed || len(p) == 0 {
-		return
-	}
-
-	remaining := cht.config.maxBytes - len(cht.buffer)
-	if remaining <= 0 {
-		return
-	}
-
-	if len(p) > remaining {
-		cht.buffer = append(cht.buffer, p[:remaining]...)
-		cht.err = fmt.Errorf("client hello exceeded %d bytes", cht.config.maxBytes)
-		cht.completed = true
-		return
-	}
-
-	cht.buffer = append(cht.buffer, p...)
-	cht.tryComputeLocked()
-}
-
-func (cht *clientHelloTracker) tryComputeLocked() {
-	data := cht.buffer
-	offset := 0
-
-	for {
-		if len(data[offset:]) < minRecordSize {
-			return
-		}
-
-		contentType := data[offset]
-		recordLength := int(binary.BigEndian.Uint16(data[offset+3 : offset+5]))
-		totalLen := minRecordSize + recordLength
-
-		if len(data[offset:]) < totalLen {
-			return
-		}
-
-		record := data[offset : offset+totalLen]
-
-		if contentType != 0x16 {
-			offset += totalLen
-			continue
-		}
-
-		if len(record) < minRecordSize+1 {
-			cht.err = fmt.Errorf("client hello record truncated")
-			cht.completed = true
-			return
-		}
-
-		handshakeType := record[5]
-		if handshakeType != 0x01 {
-			offset += totalLen
-			continue
-		}
-
-		fp, err := ja4.ParseClientHelloForJA4(record, cht.config.proto)
-		if err != nil {
-			cht.err = err
-		} else {
-			cht.fingerprint = fp
-		}
-		cht.completed = true
-		return
+func newRewindConn(conn net.Conn, data []byte) net.Conn {
+	return &rewindConn{
+		Conn: conn,
+		buf:  data,
 	}
 }
 
-// Result returns the JA4 fingerprint (if available).
-func (cht *clientHelloTracker) Result() (string, error) {
-	cht.mu.Lock()
-	defer cht.mu.Unlock()
+func (rc *rewindConn) Read(p []byte) (int, error) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
 
-	if !cht.completed {
-		cht.tryComputeLocked()
+	// First, serve the buffered data
+	if rc.offset < len(rc.buf) {
+		n := copy(p, rc.buf[rc.offset:])
+		rc.offset += n
+		return n, nil
 	}
 
-	if !cht.completed {
-		return "", ErrUnavailable
-	}
-
-	if cht.err != nil {
-		return "", cht.err
-	}
-
-	if cht.fingerprint == "" {
-		return "", ErrUnavailable
-	}
-
-	return cht.fingerprint, nil
+	// Once buffered data is exhausted, read from the underlying connection
+	return rc.Conn.Read(p)
 }
 
 // parseCaddyfileHandler parses the ja4 handler directive.
@@ -313,3 +352,8 @@ var (
 	_ caddy.Provisioner     = (*ListenerWrapper)(nil)
 	_ caddy.Validator       = (*ListenerWrapper)(nil)
 )
+
+
+
+
+

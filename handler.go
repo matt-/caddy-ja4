@@ -1,15 +1,10 @@
 package ja4s
 
 import (
-	"crypto/tls"
-	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
-	"reflect"
 	"strings"
-	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -212,109 +207,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return next.ServeHTTP(w, r)
 }
 
-// JA4FromRequest extracts the JA4 (client) fingerprint from the underlying net.Conn if it
-// is available.
+// JA4FromRequest extracts the JA4 (client) fingerprint using the connection's remote address
+// to look it up in the cache. This avoids needing to unwrap TLS connections.
 func JA4FromRequest(r *http.Request, logger *zap.Logger) (string, error) {
-	conn, err := connectionFromRequest(r, logger)
-	if err != nil {
-		return "", err
+	if r == nil || r.RemoteAddr == "" {
+		return "", ErrUnavailable
 	}
 
-	logger.Debug("connection found in request context",
-		zap.String("conn_type", fmt.Sprintf("%T", conn)),
+	// Extract the address from RemoteAddr (format: "host:port")
+	// We use RemoteAddr directly as the cache key
+	addr := r.RemoteAddr
+
+	logger.Debug("looking up JA4 fingerprint in cache",
+		zap.String("remote_addr", addr),
 	)
 
-	// First, try direct type assertion
-	provider, ok := conn.(JA4Provider)
-	if !ok {
-		// If it's a TLS connection, try to unwrap it to get the underlying connection
-		if tlsConn, isTLS := conn.(*tls.Conn); isTLS {
-			var err error
-			provider, err = unwrapTLSConnection(tlsConn, logger)
-			if err != nil {
-				logger.Warn("connection does not implement JA4Provider",
-					zap.String("conn_type", fmt.Sprintf("%T", conn)),
-					zap.Error(err),
-				)
-				return "", ErrUnavailable
-			}
-		} else {
-			logger.Warn("connection does not implement JA4Provider",
-				zap.String("conn_type", fmt.Sprintf("%T", conn)),
-			)
-			return "", ErrUnavailable
-		}
-	}
-
-	logger.Debug("connection implements JA4Provider, calling JA4()")
-	return provider.JA4()
-}
-
-// unwrapTLSConnection extracts the underlying connection from a tls.Conn using reflection.
-// This is necessary because tls.Conn's underlying connection field is unexported.
-// While this uses unsafe internally via reflect.NewAt, it provides a more structured
-// and type-safe API than direct unsafe.Pointer manipulation.
-func unwrapTLSConnection(tlsConn *tls.Conn, logger *zap.Logger) (JA4Provider, error) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			logger.Warn("panic while accessing TLS connection field",
-				zap.Any("panic", rec),
-			)
-		}
-	}()
-
-	logger.Debug("connection is TLS, attempting to unwrap",
-		zap.String("tls_conn_type", fmt.Sprintf("%T", tlsConn)),
-	)
-
-	// Use reflection to access the unexported "conn" field
-	connValue := reflect.ValueOf(tlsConn).Elem()
-	connField := connValue.FieldByName("conn")
-
-	if !connField.IsValid() {
-		return nil, fmt.Errorf("could not find 'conn' field in tls.Conn")
-	}
-
-	// For unexported fields, we need to use reflect.NewAt to create a value
-	// that can be interfaced. This requires converting the field's address
-	// to unsafe.Pointer, but uses reflection's structured API rather than
-	// direct unsafe pointer manipulation, making it safer and more maintainable.
-	if !connField.CanInterface() {
-		connField = reflect.NewAt(connField.Type(), unsafe.Pointer(connField.UnsafeAddr())).Elem()
-	}
-
-	underlyingConn, ok := connField.Interface().(net.Conn)
-	if !ok || underlyingConn == nil {
-		return nil, fmt.Errorf("underlying connection field is not a valid net.Conn")
-	}
-
-	logger.Debug("found underlying connection",
-		zap.String("underlying_conn_type", fmt.Sprintf("%T", underlyingConn)),
-	)
-
-	provider, ok := underlyingConn.(JA4Provider)
-	if !ok {
-		return nil, fmt.Errorf("underlying connection does not implement JA4Provider (type: %T)", underlyingConn)
-	}
-
-	logger.Debug("underlying connection implements JA4Provider")
-	return provider, nil
-}
-
-func connectionFromRequest(r *http.Request, logger *zap.Logger) (net.Conn, error) {
-	if r == nil {
-		return nil, errors.New("request is nil")
-	}
-
-	conn, ok := r.Context().Value(caddyhttp.ConnCtxKey).(net.Conn)
-	if !ok || conn == nil {
-		logger.Debug("connection not found in request context",
-			zap.Bool("has_value", r.Context().Value(caddyhttp.ConnCtxKey) != nil),
-		)
-		return nil, ErrUnavailable
-	}
-
-	return conn, nil
+	// Look up fingerprint in cache by connection address
+	return GetFingerprintFromCache(addr)
 }
 
 // Interface guards.
