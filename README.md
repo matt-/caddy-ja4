@@ -1,8 +1,6 @@
 ## Caddy JA4 Module (WIP)
 
-This repository provides the [JA4](https://github.com/FoxIO-LLC/ja4) fingerprint available inside the Caddy
-HTTP pipeline by using logic from
-[`github.com/voukatas/go-ja4`](https://github.com/voukatas/go-ja4).
+A caddy plugin for [JA4](https://github.com/FoxIO-LLC/ja4) hashes.
 
 ### About JA4 Fingerprints
 
@@ -22,12 +20,6 @@ Build Caddy with this module enabled, for example with `xcaddy`:
 
 xcaddy build --with github.com/matt-/caddy-ja4
 
-```
-
-**If building Caddy from source**, add this to Caddy's `go.mod`:
-
-```go
-replace github.com/matt-/caddy-ja4s => /path/to/project/caddy-ja4s
 ```
 
 ### Configuration
@@ -144,7 +136,7 @@ example.com {
 }
 ```
 
-The block file format is one fingerprint per line, with `#` for comments (both full-line and inline comments are supported):
+The block file format is one fingerprint per line, with `#` for comments:
 
 ```
 # Blocked JA4 fingerprints
@@ -171,12 +163,3 @@ example.com {
     respond "OK"
 }
 ```
-
-With `watch_block_file` enabled:
-- The block file is automatically reloaded when it changes
-- No Caddy restart or config reload is needed
-- Changes take effect immediately
-- File watching handles write, create, and rename operations (works with editors that use temp files)
-- Errors during reload are logged but don't affect existing blocking rules
-
-This is especially useful for dynamic blocking scenarios where you need to add or remove fingerprints frequently.
