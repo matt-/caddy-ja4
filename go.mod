@@ -1,4 +1,4 @@
-module github.com/matt-/caddy-ja4s
+module github.com/matt-/caddy-ja4
 
 go 1.25
 
