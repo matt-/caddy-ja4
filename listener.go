@@ -143,7 +143,8 @@ func (tl *trackingListener) Accept() (net.Conn, error) {
 
 	// Read ClientHello upfront before TLS wraps the connection
 	// For HTTP connections (port 80), this will fail, which is expected
-	clientHello, err := readClientHello(conn, tl.cfg.maxBytes)
+	// We need to use a peek/rewind approach to avoid consuming bytes from HTTP connections
+	clientHello, peekedBytes, err := readClientHelloWithPeek(conn, tl.cfg.maxBytes)
 	if err != nil {
 		// This is expected for HTTP connections (no TLS handshake)
 		// Only log at debug level to avoid noise
@@ -151,8 +152,9 @@ func (tl *trackingListener) Accept() (net.Conn, error) {
 			zap.String("remote_addr", conn.RemoteAddr().String()),
 			zap.Error(err),
 		)
-		// Return connection without JA4 capability - this is fine for HTTP
-		return conn, nil
+		// We must rewind the bytes we peeked, otherwise HTTP requests will be broken
+		// Create a rewind connection with the peeked bytes so they can be replayed
+		return newRewindConn(conn, peekedBytes), nil
 	}
 
 	// Compute JA4 fingerprint immediately
@@ -309,31 +311,45 @@ func normalizeAddr(addr string) string {
 // This is based on the approach used in caddy-ja3:
 // https://github.com/rushiiMachine/caddy-ja3
 func readClientHello(r io.Reader, maxBytes int) ([]byte, error) {
+	clientHello, _, err := readClientHelloWithPeek(r, maxBytes)
+	return clientHello, err
+}
+
+// readClientHelloWithPeek reads the ClientHello TLS record and also returns
+// the peeked bytes so they can be rewound if it's not a TLS connection.
+// Returns: (clientHello, peekedBytes, error)
+// - If TLS: clientHello contains the full record, peekedBytes is nil
+// - If not TLS: clientHello is nil, peekedBytes contains the bytes we read (for rewinding)
+func readClientHelloWithPeek(r io.Reader, maxBytes int) ([]byte, []byte, error) {
 	// Read the TLS record header (5 bytes)
 	header := make([]byte, 5)
 	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, fmt.Errorf("failed to read TLS record header: %w", err)
+		return nil, nil, fmt.Errorf("failed to read TLS record header: %w", err)
 	}
 
 	// Check if it's a TLS handshake record
 	if header[0] != tlsRecordTypeHandshake {
-		return nil, fmt.Errorf("not a TLS handshake record (got 0x%02x)", header[0])
+		// Not TLS - return the header bytes so they can be rewound
+		return nil, header, fmt.Errorf("not a TLS handshake record (got 0x%02x)", header[0])
 	}
 
 	// Get the record length
 	recordLength := int(binary.BigEndian.Uint16(header[3:5]))
 	if recordLength > maxBytes {
-		return nil, fmt.Errorf("record length %d exceeds max bytes %d", recordLength, maxBytes)
+		// Return the header bytes we read so they can be rewound
+		return nil, header, fmt.Errorf("record length %d exceeds max bytes %d", recordLength, maxBytes)
 	}
 
 	// Read the rest of the record
 	record := make([]byte, 5+recordLength)
 	copy(record, header)
 	if _, err := io.ReadFull(r, record[5:]); err != nil {
-		return nil, fmt.Errorf("failed to read TLS record body: %w", err)
+		// Return the header bytes we read so they can be rewound
+		return nil, header, fmt.Errorf("failed to read TLS record body: %w", err)
 	}
 
-	return record, nil
+	// Successfully read TLS record - no need to return peeked bytes
+	return record, nil, nil
 }
 
 // rewindConn creates a connection that allows the ClientHello data to be read again.
