@@ -389,11 +389,12 @@ func JA4FromRequest(r *http.Request, logger *zap.Logger) (string, error) {
 	}
 
 	// Extract the address from RemoteAddr (format: "host:port")
-	// We use RemoteAddr directly as the cache key
-	addr := r.RemoteAddr
+	// Normalize the address to handle IPv6 brackets and ensure consistent format
+	addr := normalizeAddr(r.RemoteAddr)
 
 	logger.Debug("looking up JA4 fingerprint in cache",
 		zap.String("remote_addr", addr),
+		zap.String("original_remote_addr", r.RemoteAddr),
 	)
 
 	// Look up fingerprint in cache by connection address

@@ -142,13 +142,16 @@ func (tl *trackingListener) Accept() (net.Conn, error) {
 	}
 
 	// Read ClientHello upfront before TLS wraps the connection
+	// For HTTP connections (port 80), this will fail, which is expected
 	clientHello, err := readClientHello(conn, tl.cfg.maxBytes)
 	if err != nil {
-		tl.cfg.logger.Debug("failed to read ClientHello from connection",
+		// This is expected for HTTP connections (no TLS handshake)
+		// Only log at debug level to avoid noise
+		tl.cfg.logger.Debug("no ClientHello found (likely HTTP connection)",
 			zap.String("remote_addr", conn.RemoteAddr().String()),
 			zap.Error(err),
 		)
-		// Continue anyway - return connection without JA4 capability
+		// Return connection without JA4 capability - this is fine for HTTP
 		return conn, nil
 	}
 
@@ -169,8 +172,14 @@ func (tl *trackingListener) Accept() (net.Conn, error) {
 	)
 
 	// Store fingerprint in cache keyed by connection address
-	addr := conn.RemoteAddr().String()
+	// Normalize the address to handle IPv6 brackets and ensure consistent format
+	addr := normalizeAddr(conn.RemoteAddr().String())
 	tl.cfg.cache.Set(addr, fingerprint)
+
+	tl.cfg.logger.Debug("stored JA4 fingerprint in cache",
+		zap.String("addr", addr),
+		zap.String("fingerprint", fingerprint),
+	)
 
 	// Create a tracked connection that will clean up the cache on close
 	tracked := &trackedConn{
@@ -282,6 +291,19 @@ const (
 
 // ErrUnavailable signals that the JA4 fingerprint could not be computed.
 var ErrUnavailable = errors.New("ja4 fingerprint unavailable")
+
+// normalizeAddr normalizes a network address to ensure consistent format
+// for cache lookups. This handles IPv6 brackets and ensures consistent formatting.
+func normalizeAddr(addr string) string {
+	if addr == "" {
+		return addr
+	}
+	// Remove brackets from IPv6 addresses if present
+	// Go's net package sometimes includes brackets, sometimes doesn't
+	addr = strings.TrimPrefix(addr, "[")
+	addr = strings.TrimSuffix(addr, "]")
+	return addr
+}
 
 // readClientHello reads the ClientHello TLS record from the connection.
 // This is based on the approach used in caddy-ja3:
